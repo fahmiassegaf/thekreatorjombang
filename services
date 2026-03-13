@@ -1,0 +1,175 @@
+import { GoogleGenAI, Content, Part, HarmCategory, HarmBlockThreshold, Tool } from "@google/genai";
+import { SYSTEM_INSTRUCTION } from '../constants';
+import { BrandContext, Message, Sender } from '../types';
+
+// Initialize Gemini Client
+// CRITICAL: process.env.API_KEY is handled by the build environment/wrapper
+// Menggunakan process.env untuk Google AI Studio, dan import.meta.env untuk Vercel
+const apiKey = (typeof process !== 'undefined' ? process.env.GEMINI_API_KEY || process.env.API_KEY : undefined) || import.meta.env.VITE_GEMINI_API_KEY;
+const ai = new GoogleGenAI({ apiKey: apiKey as string });
+
+// Premium Model Selection - Using Pro for best reasoning
+const modelName = 'gemini-3.1-pro-preview';
+
+/**
+ * SANITIZER: The "60 Billion Dollar" Logic (Refined)
+ */
+const sanitizeHistory = (history: Message[]): Content[] => {
+  const rawMessages = history.filter(msg => 
+    msg.sender !== Sender.SYSTEM
+  );
+
+  if (rawMessages.length === 0) return [];
+
+  const cleanHistory: Content[] = [];
+  let currentRole = '';
+  let currentParts: Part[] = [];
+
+  for (const msg of rawMessages) {
+    const role = msg.sender === Sender.USER ? 'user' : 'model';
+    
+    // Determine content text. NEVER send empty string as text.
+    let contentText = msg.text || "";
+
+    // Skip empty user messages if no image (shouldn't happen with proper frontend validation)
+    if (!contentText && !msg.imageUrl && role === 'user') continue;
+
+    // If consecutive roles are the same, merge them
+    if (role === currentRole) {
+       if (contentText) {
+         currentParts.push({ text: contentText });
+       }
+    } else {
+      // Push previous group
+      if (currentRole && currentParts.length > 0) {
+        cleanHistory.push({ role: currentRole, parts: currentParts });
+      }
+      
+      // Start new group
+      currentRole = role;
+      currentParts = [];
+      if (contentText) {
+        currentParts.push({ text: contentText });
+      }
+    }
+  }
+
+  // Push the final group
+  if (currentRole && currentParts.length > 0) {
+    cleanHistory.push({ role: currentRole, parts: currentParts });
+  }
+
+  // VALIDATION: First message MUST be user
+  if (cleanHistory.length > 0 && cleanHistory[0].role !== 'user') {
+    cleanHistory.shift();
+  }
+
+  return cleanHistory;
+};
+
+export const generateResponseStream = async function* (
+    history: Message[],
+    prompt: string,
+    brandContext: BrandContext,
+    attachment: { base64: string, mimeType: string } | null,
+    activeTools: string[],
+    attachmentName?: string,
+    longTermMemory?: string
+) {
+    // 1. Build System Prompt with Context
+    const contextBlock = `
+    === BRAND DNA (LAYER 3 CONTEXT) ===
+    Name: ${brandContext.name || 'Not specified'}
+    Industry: ${brandContext.industry || 'General'}
+    Niche: ${brandContext.niche || 'General'}
+    Description: ${brandContext.description || 'N/A'}
+    
+    === STRATEGY & POSITIONING ===
+    USP (Unique Selling Point): ${brandContext.usp || 'Not defined yet'}
+    Target Audience: ${brandContext.audience || 'General'}
+    Audience Pain Points: ${brandContext.painPoints || 'Not specified'}
+    Content Pillars: ${brandContext.contentPillars || 'Not specified'}
+    Voice/Tone: ${brandContext.voice}
+    Goal: ${brandContext.goal || 'General Growth'}
+    
+    === ACTIVE INTEGRATIONS ===
+    ${activeTools.join(', ')}
+    
+    === LONG TERM MEMORY (VECTOR RAG MOCK) ===
+    ${longTermMemory || 'No previous memory context available.'}
+    `;
+
+    const fullSystemInstruction = `${SYSTEM_INSTRUCTION}\n\n${contextBlock}`;
+
+    // 2. Prepare History
+    const validHistory = sanitizeHistory(history);
+
+    // 3. Prepare Current Turn
+    const currentParts: Part[] = [];
+    
+    if (attachment) {
+        currentParts.push({
+            inlineData: {
+                data: attachment.base64,
+                mimeType: attachment.mimeType
+            }
+        });
+        if (attachmentName) {
+            currentParts.push({ text: `[Attachment: ${attachmentName}]` });
+        }
+    }
+
+    if (prompt) {
+        // ENFORCEMENT PROTOCOL:
+        // Force the model to see the context right next to the user query.
+        // Also force the search tool if specific keywords are detected.
+        let forceSearch = "";
+        const searchKeywords = ['tren', 'viral', 'berita', 'news', 'kompetitor', 'cek', 'cari', 'riset', 'data', 'statistik'];
+        if (searchKeywords.some(kw => prompt.toLowerCase().includes(kw)) && activeTools.includes('Google Search')) {
+            forceSearch = " [TOOL_FORCE: GOOGLE_SEARCH]";
+        }
+
+        const enforcementSuffix = `\n\n[SYSTEM INSTRUCTION: 1. You MUST start output with ':::thinking ... :::' block detailing your KB-08 Layer Recall. 2. USE BRAND DNA from context. 3.${forceSearch} If searching, list findings in thinking block.]`;
+        
+        currentParts.push({ text: prompt + enforcementSuffix });
+    }
+
+    // Combine history + current
+    const contents = [...validHistory, { role: 'user', parts: currentParts }];
+
+    // 4. Configure Tools
+    const tools: Tool[] = [];
+    if (activeTools.includes('Google Search')) {
+        tools.push({ googleSearch: {} });
+    }
+
+    // 5. Config & Stream
+    try {
+        const responseStream = await ai.models.generateContentStream({
+            model: modelName,
+            contents: contents,
+            config: {
+                systemInstruction: fullSystemInstruction,
+                temperature: 0.7, // BALANCED: Low enough for facts/reasoning, high enough for creative writing
+                maxOutputTokens: 8192, // Increased for longer thinking blocks
+                tools: tools.length > 0 ? tools : undefined,
+                safetySettings: [
+                    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                    { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+                    { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                ]
+            }
+        });
+
+        for await (const chunk of responseStream) {
+            const text = chunk.text;
+            if (text) {
+                yield { text };
+            }
+        }
+    } catch (error) {
+        console.error("Gemini API Error:", error);
+        throw error;
+    }
+};
